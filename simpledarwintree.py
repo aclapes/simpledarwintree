@@ -112,8 +112,15 @@ def _atep(trees_i, trees_j, points, kernel_map=None, norm=None, lock=None, verbo
     last_i = -1
     for k,(i,j) in enumerate(points):
         if last_i < 0 or last_i != i:
-            ti = preprocessing.normalize(apply_kernel_map(trees_i[i], map=kernel_map, copy=False), norm=norm, axis=1, copy=False)
-        tj = preprocessing.normalize(apply_kernel_map(trees_j[j], map=kernel_map, copy=False), norm=norm, axis=1, copy=False)
+            if kernel_map is None and norm is None:
+                ti = trees_i[i]
+            else:
+                ti = preprocessing.normalize(apply_kernel_map(trees_i[i], map=kernel_map, copy=False), norm=norm, axis=1, copy=False)
+        if kernel_map is None and norm is None:
+            tj = trees_j[j]
+        else:
+            tj = preprocessing.normalize(apply_kernel_map(trees_j[j], map=kernel_map, copy=False), norm=norm, axis=1, copy=False)
+
         pair_leafs_dists = np.dot(ti,tj.T)
         res[k] = np.sum(pair_leafs_dists) / np.prod(pair_leafs_dists.shape)
         last_i = i
@@ -274,14 +281,14 @@ def simpledarwintree(cfg):
                 # makedirs(cfg['darws_py_path'])
                 # makedirs(vd_py_path)
                 # makedirs(tree_py_path)
-                makedirs(cfg['atep_path'])
+                makedirs(cfg['output_kernels_path'])
             except:
                 pass
 
             root_kernel_name = 'kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
             tree_kernel_name = 'tree_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
-            root_kernel_filepath = join(cfg['atep_path'], root_kernel_name + '.pkl')
-            tree_kernel_filepath = join(cfg['atep_path'], tree_kernel_name + '.pkl')
+            root_kernel_filepath = join(cfg['output_kernels_path'], root_kernel_name + '.pkl')
+            tree_kernel_filepath = join(cfg['output_kernels_path'], tree_kernel_name + '.pkl')
 
             if not exists(root_kernel_filepath) or not exists(tree_kernel_filepath):
                 # List darwin representations/tree-representations paths from disk
@@ -310,9 +317,11 @@ def simpledarwintree(cfg):
                     if not exists(tree_kernel_filepath):
                         tree_mat = loadmat(join(tree_path, darws[i]))
                         # Wtree = np.hstack( (tree_mat['Wtree'], np.zeros((tree_mat['Wtree'].shape[0],1))) )
-                        # all_trees[i] = preprocessing.normalize(apply_kernel_map(Wtree,map=cfg['kernel_map']), norm=cfg['norm'], axis=1)
-                        # all_trees[i] = np.hstack( (tree_mat['Wtree'], np.zeros((tree_mat['Wtree'].shape[0],1))) )
-                        all_trees[i] = tree_mat['Wtree']
+                        # all_trees[i] = preprocessing.normalize(apply_kernel_map(tree_mat['Wtree'],map=cfg['kernel_map']), norm=cfg['norm'], axis=1)
+                        if not cfg['pre_mapping']:
+                            all_trees[i] = tree_mat['Wtree']
+                        else:
+                            all_trees[i] = preprocessing.normalize(apply_kernel_map(tree_mat['Wtree'],map=cfg['kernel_map'],copy=False), norm=cfg['norm'], axis=1, copy=False)
                     # with open(join(tree_py_path, darws[i]), 'wb') as f:
                     #     cPickle.dump(tree_mat,f)
 
@@ -379,6 +388,9 @@ def simpledarwintree(cfg):
                 # -------------------------------------------------------------------------------------
                 # -------------------------------------------------------------------------------------
 
+                kernel_map = None if cfg['pre_mapping'] else cfg['kernel_map']
+                norm = None if cfg['pre_mapping'] else cfg['norm']
+
                 if not exists(root_kernel_filepath):
                     # all_roots = np.sqrt(all_roots, dtype=np.complex128)
                     print('Kernel (train)...')
@@ -387,20 +399,20 @@ def simpledarwintree(cfg):
                     K_test  = np.dot(all_roots[inds_test, :], all_roots[inds_train, :].T)
                     print('Saving (kernel train/test)... '),
                     with open(root_kernel_filepath, 'wb') as f:
-                        cPickle.dump(dict(kernel_map=cfg['kernel_map'], norm=cfg['norm'], \
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
                                           kernels=(K_train, K_test), labels=(labels_train, labels_test)), f)
                     print('DONE.')
 
                 if not exists(tree_kernel_filepath):
                     print('Tree kernel (train)...')
                     Kn_train = atep(all_trees[inds_train], all_trees[inds_train], is_train=True,
-                                    kernel_map=cfg['kernel_map'], norm=cfg['norm'], nt=35)
+                                    kernel_map=kernel_map, norm=norm, nt=35)
                     print('Tree kernel (test)...')
                     Kn_test  = atep(all_trees[inds_test], all_trees[inds_train],
-                                    kernel_map=cfg['kernel_map'], norm=cfg['norm'], nt=35)
+                                    kernel_map=kernel_map, norm=norm, nt=35)
                     print('Saving (kernel train/test)... '),
                     with open(tree_kernel_filepath, 'wb') as f:
-                        cPickle.dump(dict(kernel_map=cfg['kernel_map'], norm=cfg['norm'], \
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
                                           kernels=(Kn_train,Kn_test), labels=(labels_train,labels_test)), f)
                     print('DONE.')
 
