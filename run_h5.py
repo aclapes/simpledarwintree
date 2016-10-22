@@ -7,7 +7,7 @@ cfg = dict(
     output_kernels_path = '/data/hupba/Derived/darwintree.pyimpl/highfive/kernels/',
     norm='l2',
     kernel_map='posneg',
-    pre_mapping=True,  # if True less RAM but slower (recommended in case of kernel_map == 'posneg')
+    pre_processing=True,  # if True less RAM but slower (recommended in case of kernel_map == 'posneg')
     partitions = [1,2],
     negative_class = 5,
     metric = 'acc', # acc or map

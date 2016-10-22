@@ -7,7 +7,8 @@ cfg = dict(
     output_kernels_path = '/data/hupba/Derived/darwintree.pyimpl/ucf_sports_actions/kernels/',
     norm='l2',
     kernel_map='posneg',
-    pre_kernel_mapping=True,  # if True less RAM but slower (recommended in case of kernel_map == 'posneg')
+    pre_processing=True,  # kernel mapping and norm when loading to RAM darwin representations.
+                          # if True less RAM but slower (recommended in case of kernel_map == 'posneg')
     partitions = [1],  # one and only partition
     negative_class = None,
     metric = 'acc',  # acc or map

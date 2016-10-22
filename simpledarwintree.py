@@ -124,10 +124,12 @@ def _atep(trees_i, trees_j, points, kernel_map=None, norm=None, lock=None, verbo
         pair_leafs_dists = np.dot(ti,tj.T)
         res[k] = np.sum(pair_leafs_dists) / np.prod(pair_leafs_dists.shape)
         last_i = i
-        with lock:
-            lock.update()
-            if verbose:
-                print('Progress: %.2f%%' % (lock.progress()*100.0))
+
+        lock.acquire()
+        lock.update()  # update progress tracking variable
+        if verbose:
+            print('Progress: %.2f%%' % (lock.progress()*100.0))
+        lock.release()
 
     return points, res
 
@@ -267,12 +269,14 @@ def simpledarwintree(cfg):
 
         root_kernels = {}
         tree_kernels = {}
+        branch_kernels = {}
 
         for feat_t in cfg['feat_types']:
             print feat_t
 
             vd_path = join(cfg['darws_path'], 'representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
             tree_path = join(cfg['darws_path'], 'tree_representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
+            branch_path = join(cfg['darws_path'], 'branch_representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
 
             # vd_py_path = join(cfg['darws_py_path'], 'representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
             # tree_py_path = join(cfg['darws_py_path'], 'tree_representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
@@ -287,10 +291,13 @@ def simpledarwintree(cfg):
 
             root_kernel_name = 'kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
             tree_kernel_name = 'tree_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
+            branch_kernel_name = 'branch_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
+
             root_kernel_filepath = join(cfg['output_kernels_path'], root_kernel_name + '.pkl')
             tree_kernel_filepath = join(cfg['output_kernels_path'], tree_kernel_name + '.pkl')
+            branch_kernel_filepath = join(cfg['output_kernels_path'], branch_kernel_name + '.pkl')
 
-            if not exists(root_kernel_filepath) or not exists(tree_kernel_filepath):
+            if not exists(root_kernel_filepath) or not exists(tree_kernel_filepath) or not exists(branch_kernel_filepath):
                 # List darwin representations/tree-representations paths from disk
                 darws = [f for f in listdir(vd_path) if isfile(join(vd_path, f)) and splitext(f)[-1] == '.mat']
                 darws.sort(key=get_id_from_darwinfile)
@@ -299,6 +306,7 @@ def simpledarwintree(cfg):
                 # Preprocessing: posneg kernel map followed by l2-norm
                 all_roots = None
                 all_trees = [[] for i in xrange(len(darws))]
+                all_branches = [[] for i in xrange(len(darws))]
                 for i in xrange(len(darws)):
                     print ('[%d/%d] Loading darws..' % (i+1,len(darws)))
                     print darws[i]
@@ -318,14 +326,22 @@ def simpledarwintree(cfg):
                         tree_mat = loadmat(join(tree_path, darws[i]))
                         # Wtree = np.hstack( (tree_mat['Wtree'], np.zeros((tree_mat['Wtree'].shape[0],1))) )
                         # all_trees[i] = preprocessing.normalize(apply_kernel_map(tree_mat['Wtree'],map=cfg['kernel_map']), norm=cfg['norm'], axis=1)
-                        if not cfg['pre_mapping']:
+                        if not cfg['pre_processing']:
                             all_trees[i] = tree_mat['Wtree']
                         else:
                             all_trees[i] = preprocessing.normalize(apply_kernel_map(tree_mat['Wtree'],map=cfg['kernel_map'],copy=False), norm=cfg['norm'], axis=1, copy=False)
                     # with open(join(tree_py_path, darws[i]), 'wb') as f:
                     #     cPickle.dump(tree_mat,f)
 
+                    if not exists(branch_kernel_filepath):
+                        branch_mat = loadmat(join(branch_path, darws[i]))
+                        if not cfg['pre_processing']:
+                            all_branches[i] = branch_mat['Btree']
+                        else:
+                            all_branches[i] = preprocessing.normalize(apply_kernel_map(branch_mat['Btree'],map=cfg['kernel_map'],copy=False), norm=cfg['norm'], axis=1, copy=False)
+
                 all_trees = np.array(all_trees)
+                all_branches = np.array(all_branches)
 
                 # Get training and test split from our standard file
                 inds_train = np.squeeze(train_test_split['cur_train_indx'][0][pt-1])-1
@@ -341,6 +357,10 @@ def simpledarwintree(cfg):
 
                 if len(all_trees) < len(labels):
                     sys.stderr.write('Tree representations missing. Quitting.')
+                    quit()
+
+                if len(all_branches) < len(labels):
+                    sys.stderr.write('Branch representations missing. Quitting.')
                     quit()
 
                 # Encode binary vector labels to integers ([0,0,0,0,1,0] -> 5)
@@ -388,8 +408,8 @@ def simpledarwintree(cfg):
                 # -------------------------------------------------------------------------------------
                 # -------------------------------------------------------------------------------------
 
-                kernel_map = None if cfg['pre_mapping'] else cfg['kernel_map']
-                norm = None if cfg['pre_mapping'] else cfg['norm']
+                kernel_map = None if cfg['pre_processing'] else cfg['kernel_map']
+                norm = None if cfg['pre_processing'] else cfg['norm']
 
                 if not exists(root_kernel_filepath):
                     # all_roots = np.sqrt(all_roots, dtype=np.complex128)
@@ -402,6 +422,7 @@ def simpledarwintree(cfg):
                         cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
                                           kernels=(K_train, K_test), labels=(labels_train, labels_test)), f)
                     print('DONE.')
+                del all_roots
 
                 if not exists(tree_kernel_filepath):
                     print('Tree kernel (train)...')
@@ -415,9 +436,21 @@ def simpledarwintree(cfg):
                         cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
                                           kernels=(Kn_train,Kn_test), labels=(labels_train,labels_test)), f)
                     print('DONE.')
-
-                del all_roots
                 del all_trees
+
+                if not exists(branch_kernel_filepath):
+                    print('Branch kernel (train)...')
+                    Kb_train = atep(all_branches[inds_train], all_branches[inds_train], is_train=True,
+                                    kernel_map=kernel_map, norm=norm, nt=35)
+                    print('Branch kernel (test)...')
+                    Kb_test  = atep(all_branches[inds_test], all_branches[inds_train],
+                                    kernel_map=kernel_map, norm=norm, nt=35)
+                    print('Saving (kernel train/test)... '),
+                    with open(branch_kernel_filepath, 'wb') as f:
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                          kernels=(Kb_train,Kb_test), labels=(labels_train,labels_test)), f)
+                    print('DONE.')
+                del all_branches
 
             # Evaluate metric
 
@@ -427,8 +460,12 @@ def simpledarwintree(cfg):
             with open(tree_kernel_filepath, 'rb') as f:
                 tree_pkl = cPickle.load(f)
                 tree_kernels[feat_t] = tree_pkl['kernels']
+            with open(branch_kernel_filepath, 'rb') as f:
+                branch_pkl = cPickle.load(f)
+                branch_kernels[feat_t] = branch_pkl['kernels']
 
-            train_and_classify([root_pkl['kernels'], tree_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'])
+            train_and_classify([root_pkl['kernels'], tree_pkl['kernels'], branch_pkl['kernels']],
+                               root_pkl['labels'], metric=cfg['metric'])
             # train_and_classify([root_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'])
 
         print 'all'
