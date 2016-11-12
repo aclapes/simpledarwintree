@@ -2,6 +2,9 @@ import numpy as np
 import random
 from operator import itemgetter
 
+import itertools
+import math
+
 def point_distribution(n,m,random_seed=None):
     """
     Generate n m-dimensional points
@@ -33,5 +36,13 @@ def subset_sum(numbers, target, partial=[]):
         subset_sum(remaining, target, partial + [n])
 
 
+def generate_weights(n, m=11):
+    weights = []
+    for w in itertools.product(*([np.linspace(0,1,m)]*n)):
+        if np.sum(w) == 1:
+            weights.append(w)
+
+    return weights
+
 if __name__ == "__main__":
-    subset_sum(linspace(0))
+    print len(generate_weights(3,m=21))
