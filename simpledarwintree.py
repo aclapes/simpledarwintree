@@ -11,19 +11,18 @@ import random
 import threading
 from copy import deepcopy
 import svmutil
+import h5py
 
 import pycuda.gpuarray as gpuarray
 # import pycuda.autoinit
 from pycuda.elementwise import ElementwiseKernel
 
+from sklearn.metrics import confusion_matrix
+
 import skcuda.misc as misc
 import pycuda.driver as driver
-dev=driver.Device(2)
-dev.make_context()
 import skcuda.linalg as linalg
 import pycuda.cumath as cumath
-misc.init()
-linalg.init()
 
 import time
 
@@ -195,7 +194,8 @@ def _atep_gpu(trees_i, trees_j, points, kernel_map=None, norm=None, verbose=Fals
     last_i = -1
     for k,(i,j) in enumerate(points):
         if last_i < 0 or last_i != i:
-            ti_gpu = gpuarray.to_gpu(trees_i[i])
+            ti_gpu = gpuarray.to_gpu(trees_i[i][:,1:])
+            wi = 2**np.floor(np.log2(trees_i[i][:,0]))
 
             if kernel_map == 'rootsift':
                 ti_m_gpu = gpuarray.empty_like(ti_gpu)
@@ -210,7 +210,8 @@ def _atep_gpu(trees_i, trees_j, points, kernel_map=None, norm=None, verbose=Fals
 
             ti_mn_gpu = misc.div_matvec(ti_m_gpu, gpuarray.to_gpu(norm), axis=0)
 
-        tj_gpu = gpuarray.to_gpu(trees_j[j])
+        tj_gpu = gpuarray.to_gpu(trees_j[j][:,1:])
+        wj = 2**np.floor(np.log2(trees_j[j][:,0]))
 
         if kernel_map == 'rootsift':
             tj_m_gpu = gpuarray.empty_like(tj_gpu)
@@ -225,8 +226,11 @@ def _atep_gpu(trees_i, trees_j, points, kernel_map=None, norm=None, verbose=Fals
 
         tj_mn_gpu = misc.div_matvec(tj_m_gpu, gpuarray.to_gpu(norm), axis=0)
 
-        div = np.prod([ti_mn_gpu.shape[0],tj_mn_gpu.shape[0]])
-        res[k] = misc.sum(linalg.dot(ti_mn_gpu,tj_mn_gpu,transb='T')).get() / div
+        # W_gpu =  1/cumath.sqrt(gpuarray.to_gpu(np.outer(wi,wj)))
+        # res_aux = linalg.multiply(linalg.dot(ti_mn_gpu,tj_mn_gpu,transb='T'),W_gpu)
+        res_aux = linalg.dot(ti_mn_gpu,tj_mn_gpu,transb='T')
+        res[k] = misc.sum(res_aux).get() / np.prod([ti_mn_gpu.shape[0],tj_mn_gpu.shape[0]])
+        print res[k], ' ',
         last_i = i
 
         if verbose:
@@ -235,11 +239,11 @@ def _atep_gpu(trees_i, trees_j, points, kernel_map=None, norm=None, verbose=Fals
     return points, res
 
 
-def train_and_classify(kernels, labels, metric='acc', neg_class=None):
+def train_and_classify(kernels, labels, metric='acc', C=[100]):
     if metric == 'acc':
-        train_and_classify_acc(kernels, labels, neg_class=neg_class)
+        train_and_classify_acc(kernels, labels, C=C)
     elif metric == 'map':
-        train_and_classify_map(kernels, labels, neg_class=neg_class)
+        train_and_classify_map(kernels, labels, C=C)
 
 
 def random_point_distribution(n,m,random_seed=None):
@@ -266,11 +270,12 @@ def generate_weights(n, m=9):
 
     return weights
 
-def train_and_classify_acc(kernels, labels, C=[100], neg_class=None):
+
+def train_and_classify_acc(kernels, labels, C=[100]):
     # Fuse different modalities by averaging
     for i,representations in enumerate(kernels):
         if not isinstance(representations, tuple):
-            a = [np.max(np.diag(K)) for (K,_) in representations.values()]
+            a = [1 for (K,_) in representations.values()]  #[np.max(np.diag(K)) for (K,_) in representations.values()]
             kernels[i] = (np.sum([(1.0/len(representations))*(K/a[k]) for k,(K,_) in enumerate(representations.values())],axis=0),
                           np.sum([(1.0/len(representations))*(K/a[k]) for k,(_,K) in enumerate(representations.values())],axis=0))
 
@@ -290,35 +295,51 @@ def train_and_classify_acc(kernels, labels, C=[100], neg_class=None):
     C_perfs = np.zeros((W.shape[0],len(C)), dtype=np.float32)
     for i in xrange(W.shape[0]):
         w = W[i,:]
-        K_train = np.sum([w[k]*(K/np.max(np.diag(K))) for k,(K,_) in enumerate(kernels)], axis=0)
-        # K_test  = np.sum([w[k]*K for k,(_,K) in enumerate(kernels)], axis=0)
         for j,c in enumerate(C):
-            cv = cross_validation.StratifiedKFold(labels_train, n_folds=3, random_state=42)
+            cv = cross_validation.StratifiedKFold(labels_train, n_folds=4, random_state=0)
             cv_val_perfs = []
             for v,(val_tr,val_te) in enumerate(cv):
+                a = [np.max(np.diag(K[val_tr,:][:,val_tr])) for _,(K,_) in enumerate(kernels)]
+                # a = [1 for _,(K,_) in enumerate(kernels)]
+                K_train_val = np.sum([w[k]*(K[val_tr,:][:,val_tr]/a[k]) for k,(K,_) in enumerate(kernels)], axis=0)
+                K_test_val = np.sum([w[k]*(K[val_te,:][:,val_tr]/a[k]) for k,(K,_) in enumerate(kernels)], axis=0)
+
                 ovr = multiclass.OneVsRestClassifier(svm.SVC(kernel='precomputed', class_weight='balanced', C=c, random_state=42))
-                ovr.fit(K_train[val_tr,:][:,val_tr], labels_train[val_tr])
-                acc = metrics.accuracy_score(labels_train[val_te], ovr.predict(K_train[val_te,:][:,val_tr]))
+                ovr.fit(K_train_val, labels_train[val_tr])
+                acc = metrics.accuracy_score(labels_train[val_te], ovr.predict(K_test_val))
                 cv_val_perfs.append(acc)
             C_perfs[i,j] = np.mean(cv_val_perfs)
 
     best_idx = np.unravel_index(np.argmax(C_perfs), C_perfs.shape)
     w = W[best_idx[0],:]
     c = C[best_idx[1]]
-    print 'Validation weight: {0}, c: {1}, acc: {2:.4f}'.format(w,c,np.max(C_perfs))
+    print 'Validation weight: {0}, c: {1}, acc: {2:2.2f}'.format(w,c,np.max(C_perfs)*100.0)
 
     ovr = multiclass.OneVsRestClassifier(svm.SVC(kernel='precomputed', class_weight='balanced', C=c, random_state=42))
 
     a = [np.max(np.diag(K)) for _,(K,_) in enumerate(kernels)]
+    # a = [1 for _,(K,_) in enumerate(kernels)]
     K_train = np.sum([w[k]*(K/a[k]) for k,(K,_) in enumerate(kernels)], axis=0)
     ovr.fit(K_train, labels_train)
 
     K_test  = np.sum([w[k]*(K/a[k]) for k,(_,K) in enumerate(kernels)], axis=0)
 
     preds = ovr.predict(K_test)
-    print 'Out-of-sample acc: {0:.4f}'.format(metrics.accuracy_score(labels_test, preds))
 
-# def train_and_classify_acc(kernels, labels, C=[100], neg_class=None):
+    binary_accs = []
+    unique_preds = np.unique(preds)
+    for u in unique_preds:
+        acc = metrics.accuracy_score(labels_test == u, preds == u)
+        print '{0:2.4f} '.format(acc)
+    print
+
+
+    print 'y_test: ', ",".join(np.char.mod('%d', labels_test))
+    print 'y_pred: ', ",".join(np.char.mod('%d', preds))
+
+    print 'Out-of-sample acc: {0:2.2f}'.format(metrics.accuracy_score(labels_test, preds)*100.0)
+
+# def train_and_classify_acc(kernels, labels, C=[100]):
 #     # Fuse different modalities by averaging
 #     for i,representations in enumerate(kernels):
 #         if not isinstance(representations, tuple):
@@ -358,7 +379,7 @@ def train_and_classify_acc(kernels, labels, C=[100], neg_class=None):
 #     print 'Out-of-sample acc:', metrics.accuracy_score(labels_test, preds)
 
 
-def train_and_classify_map(kernels, labels, C=[100], neg_class=None):
+def train_and_classify_map(kernels, labels, C=[100]):
     _kernels = deepcopy(kernels)
     # Fuse different modalities by averaging
     for i,representations in enumerate(_kernels):
@@ -371,7 +392,7 @@ def train_and_classify_map(kernels, labels, C=[100], neg_class=None):
     if len(_kernels) == 1:
         W = np.array([[1.0]])
     elif len(_kernels) == 2:
-        lin = np.linspace(0,1,17)
+        lin = np.linspace(0.1,0.9,7)
         W = np.vstack((lin, 1-lin)).T
     else:
         W = np.array(generate_weights(len(_kernels),17))
@@ -381,43 +402,60 @@ def train_and_classify_map(kernels, labels, C=[100], neg_class=None):
 
     unique_classes = np.unique(labels_test)
     ap_classes = [None] * len(unique_classes)
+    ap_val_classes = [None] * len(unique_classes)
 
     for l,cl in enumerate(unique_classes):
         C_perfs = np.zeros((W.shape[0],len(C)), dtype=np.float32)
         for i in xrange(W.shape[0]):
             w = W[i,:]
-            K_train = np.sum([w[k]*(K/np.max(np.diag(K))) for k,(K,_) in enumerate(_kernels)], axis=0)
+            # K_train = np.sum([w[k]*(K/np.max(np.diag(K))) for k,(K,_) in enumerate(_kernels)], axis=0)
             # K_test  = np.sum([w[k]*K for k,(_,K) in enumerate(_kernels)], axis=0)
             for j,c in enumerate(C):
-                cv = cross_validation.StratifiedKFold(labels_train == cl, n_folds=4, random_state=42)
+                cv = cross_validation.StratifiedKFold(labels_train == cl, n_folds=10, random_state=42)
                 cv_perfs = []
                 for v,(val_tr,val_te) in enumerate(cv):
-                    # print val_tr[:5]
+                    # a = [np.max(np.diag(K[val_tr,:][:,val_tr])) for _,(K,_) in enumerate(_kernels)]
+                    a = [1 for _,(K,_) in enumerate(kernels)]
+                    K_train_val = np.sum([w[k]*(K[val_tr,:][:,val_tr]/a[k]) for k,(K,_) in enumerate(_kernels)], axis=0)
+                    K_test_val = np.sum([w[k]*(K[val_te,:][:,val_tr]/a[k]) for k,(K,_) in enumerate(_kernels)], axis=0)
+
                     model = svm.SVC(kernel='precomputed', class_weight='balanced', C=c, random_state=42)
-                    model.fit(K_train[val_tr, :][:, val_tr], labels_train[val_tr] == cl)
+                    model.fit(K_train_val, labels_train[val_tr] == cl)
                     map = metrics.average_precision_score(labels_train[val_te] == cl,
-                                                          model.decision_function(K_train[val_te, :][:, val_tr]))
+                                                          model.decision_function(K_test_val))
                     cv_perfs.append(map)
                 C_perfs[i,j] = np.mean(cv_perfs)
 
         best_idx = np.unravel_index(np.argmax(C_perfs), C_perfs.shape)
         w = W[best_idx[0],:]
         c = C[best_idx[1]]
-        print w,c,np.max(C_perfs)
+        # print w,c,np.max(C_perfs)
+        ap_val_classes[l] = np.nanmax(C_perfs)
 
         model = svm.SVC(kernel='precomputed', class_weight='balanced', C=c, random_state=42)
 
-        a = [np.max(np.diag(K)) for _,(K,_) in enumerate(_kernels)]
+        # a = [np.max(np.diag(K)) for _,(K,_) in enumerate(_kernels)]
+        a = [1 for _,(K,_) in enumerate(_kernels)]
         K_train = np.sum([w[k]*(K/a[k]) for k,(K,_) in enumerate(_kernels)], axis=0)
         model.fit(K_train, labels_train == cl)
 
         K_test  = np.sum([w[k]*(K/a[k]) for k,(_,K) in enumerate(_kernels)], axis=0)
-        ap_classes[l] = metrics.average_precision_score(labels_test == cl, model.decision_function(K_test))
 
+        print cl
+        print labels_test
+        y_test = (labels_test == cl)
+        y_pred = model.decision_function(K_test)
+        print y_test.astype('int')
+        print (y_pred >= 0).astype('int')
+
+        ap_classes[l] = metrics.average_precision_score(y_test, y_pred)
+
+    print ap_val_classes
+    print 'Validation mAP: {0:2.2f}'.format(np.mean(ap_val_classes)*100.)
     print ap_classes
-    print 'Out-of-sample mAP: {0:.4f}'.format(np.mean(ap_classes))
+    print 'Out-of-sample mAP: {0:2.2f}'.format(np.mean(ap_classes)*100.)
 
-def load_darwins(indices, representations):
+def load_darwins(indices, representations, max_depth=4):
     # TODO: this is a nasty fix. find a better solution for polimorphism
     # ---
     if isinstance(representations[0],basestring):
@@ -429,21 +467,53 @@ def load_darwins(indices, representations):
     for i,idx in enumerate(indices):
         print('%d/%d' % (i+1, len(indices)))
         aux = []
+        nodeid = None
         for j in xrange(len(representations)):
-            mat = loadmat(representations[j][idx])
-            if 'W' in mat:
-                aux.append(np.squeeze(mat['W']))
-            elif 'Wtree' in mat:
-                Wtree = mat['Wtree']
-                aux.append(Wtree)
-            elif 'Btree' in mat:
-                Btree = mat['Btree']
-                aux.append(Btree)
+            try:
+                mat = loadmat(representations[j][idx])  # raise not implemented ee
+                if 'W' in mat:
+                    aux.append(np.squeeze(mat['W']))
+                elif 'Wtree' in mat:
+                    nodeid = np.squeeze(mat['nodeid'])
+                    Wtree = mat['Wtree'][np.logical_and(nodeid > 1, nodeid < 2**max_depth),:]
+                    aux.append(Wtree)
+                elif 'Btree' in mat:
+                    nodeid = np.squeeze(mat['nodeid'])
+                    Btree = mat['Btree'][np.logical_and(nodeid > 1, nodeid < 2**max_depth),:]
+                    aux.append(Btree)
+            except (NotImplementedError, ValueError) as e:
+                print 'h5py'
+                mat = h5py.File(representations[j][idx])
+                if 'W' in mat.keys():
+                    aux.append(mat['W'].value)
+                    # raise AssertionError('TODO: assume W is not stored in -v7.3')
+                elif 'Wtree' in mat.keys():
+                    if 'nodeid' in mat.keys():
+                        nodeid = np.squeeze(mat['nodeid'].value)
+                        Wtree = mat['Wtree'].value[:,nodeid < 2**max_depth].T
+                    else:
+                        Wtree = mat['Wtree'].value.T
+                    aux.append(Wtree)
+                elif 'Btree' in mat.keys():
+                    if 'nodeid' in mat.keys():
+                        nodeid = np.squeeze(mat['nodeid'].value)
+                        Btree = mat['Btree'].value[:, nodeid < 2**max_depth].T
+                    else:
+                        Btree = mat['Btree'].value.T
+                    aux.append(Btree)
 
         if len(aux) == 1:
-            all[i] = np.ascontiguousarray(aux[0],dtype=np.float32)
+            aux = np.ascontiguousarray(aux[0],dtype=np.float32)
         else:
-            all[i] = np.ascontiguousarray(np.concatenate(aux,axis=1),dtype=np.float32)
+            aux = np.ascontiguousarray(np.concatenate(aux,axis=1),dtype=np.float32)
+
+        print aux.shape
+
+        if nodeid is None:
+            all[i] = aux
+        else:
+            nodeid = nodeid[nodeid < 2**max_depth]
+            all[i] = np.hstack((nodeid[:,np.newaxis].astype(np.float32), aux))
 
     return np.array(all)
 
@@ -468,17 +538,17 @@ def load_darwins(indices, representations):
 #                 all_trees[i] = preprocessing.normalize(apply_kernel_map(tree,map=cfg['kernel_map'],copy=False), norm=cfg['norm'], axis=1, copy=False)
 #         all_trees = np.array(all_trees)
 
-def distributed_atep(dw_paths, inds, inds_train=None,  \
+def distributed_atep(dw_paths, inds, chunks='all', inds_train=None, max_depth=64,
                      kernel_map='rootsift', norm='l2', use_gpu=None, verbose=False):
     if inds_train is None:
-        return distibuted_atep_train(dw_paths, inds,  \
+        return distibuted_atep_train(dw_paths, inds, chunks,max_depth=max_depth,
                                      kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
     else:
-        return distibuted_atep_test(dw_paths, inds, inds_train,  \
+        return distibuted_atep_test(dw_paths, inds, inds_train, max_depth=max_depth,
                                     kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
 
 
-def distibuted_atep_train(dw_paths, inds, kernel_map='rootsift', norm='l2', use_gpu=None, verbose=False):
+def distibuted_atep_train(dw_paths, inds, chunks='all', max_depth=64, kernel_map='rootsift', norm='l2', use_gpu=None, intermediates_path=None, verbose=False):
     n = len(inds)
 
     x_inds = range(n/4)
@@ -489,22 +559,49 @@ def distibuted_atep_train(dw_paths, inds, kernel_map='rootsift', norm='l2', use_
     xy_inds = np.concatenate([x_inds,y_inds])
     zw_inds = np.concatenate([z_inds,w_inds])
 
-    xy = load_darwins( inds[xy_inds], dw_paths )
+    st_time = time.time()
+    xy = load_darwins( inds[xy_inds], dw_paths, max_depth=max_depth )
     A = atep(xy, xy, is_train=True, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    if intermediates_path:
+        with open(join(intermediates_path, 'A.pkl'), 'wb') as f:
+            cPickle.dump(A,f)
+    print('[Distributed kernel (train)] Big time %.2f secs.' % (time.time() - st_time))
     x = xy[:xy.shape[0]/2]
-    z = load_darwins( inds[z_inds], dw_paths )
+
+    st_time = time.time()
+    z = load_darwins( inds[z_inds], dw_paths, max_depth=max_depth )
     C = atep(x, z, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
     del z
-    w = load_darwins( inds[w_inds], dw_paths )
+    if intermediates_path:
+        with open(join(intermediates_path, 'C.pkl'), 'wb') as f:
+            cPickle.dump(C,f)
+    print('[Distributed kernel (train)] Little time %.2f secs.' % (time.time() - st_time))
+
+    w = load_darwins( inds[w_inds], dw_paths, max_depth=max_depth )
     D = atep(x, w, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    if intermediates_path:
+        with open(join(intermediates_path, 'D.pkl'), 'wb') as f:
+            cPickle.dump(D,f)
     del x
-    y = load_darwins( inds[y_inds], dw_paths )
+
+    y = load_darwins( inds[y_inds], dw_paths, max_depth=max_depth )
     E = atep(y, w, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
-    z = load_darwins( inds[z_inds], dw_paths )
+    if intermediates_path:
+        with open(join(intermediates_path, 'E.pkl'), 'wb') as f:
+            cPickle.dump(E,f)
+
+    z = load_darwins( inds[z_inds], dw_paths, max_depth=max_depth )
     F = atep(y, z, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    if intermediates_path:
+        with open(join(intermediates_path, 'F.pkl'), 'wb') as f:
+            cPickle.dump(F,f)
     del y
+
     zw = np.concatenate((z,w))
     B = atep(zw, zw, is_train=True, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    if intermediates_path:
+        with open(join(intermediates_path, 'B.pkl'), 'wb') as f:
+            cPickle.dump(B,f)
     del zw
 
     K = np.zeros((n,n), dtype=np.float32)
@@ -520,25 +617,100 @@ def distibuted_atep_train(dw_paths, inds, kernel_map='rootsift', norm='l2', use_
     return K
 
 
-def distibuted_atep_test(dw_paths, inds_te, inds_tr, kernel_map='rootsift', norm='l2', use_gpu=None, verbose=False):
+# def distibuted_atep_test(dw_paths, inds_te, inds_tr, max_depth=64, kernel_map='rootsift', norm='l2', use_gpu=True, intermediates_path=None, verbose=False):
+#     n = len(inds_te)
+#     m = len(inds_tr)
+#
+#     xte_inds, xtr_inds = range(n/2), range(m/2)
+#     yte_inds, ytr_inds = range(n/2,n), range(m/2,m)
+#
+#     st_time = time.time()
+#     xte = load_darwins(inds_te[xte_inds], dw_paths, max_depth=max_depth)
+#     xtr = load_darwins(inds_tr[xtr_inds], dw_paths, max_depth=max_depth)
+#     A = atep(xte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+#     del xte
+#     if intermediates_path:
+#         with open(join(intermediates_path, 'A.pkl'), 'wb') as f:
+#             cPickle.dump(A,f)
+#     print('[Distributed kernel (test)] Time %.2f secs.' % (time.time() - st_time))
+#
+#     yte = load_darwins(inds_te[yte_inds], dw_paths, max_depth=max_depth)
+#     B = atep(yte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+#     del xtr
+#     if intermediates_path:
+#         with open(join(intermediates_path, 'B.pkl'), 'wb') as f:
+#             cPickle.dump(B,f)
+#
+#     ytr = load_darwins(inds_tr[ytr_inds], dw_paths, max_depth=max_depth)
+#     C = atep(yte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+#     del yte
+#     if intermediates_path:
+#         with open(join(intermediates_path, 'C.pkl'), 'wb') as f:
+#             cPickle.dump(C,f)
+#
+#     xte = load_darwins(inds_te[xte_inds], dw_paths, max_depth=max_depth)
+#     D = atep(xte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+#     if intermediates_path:
+#         with open(join(intermediates_path, 'D.pkl'), 'wb') as f:
+#             cPickle.dump(D,f)
+#
+#     K = np.zeros((n,m), dtype=np.float32)
+#     K[np.ix_(xte_inds,xtr_inds)] = A
+#     K[np.ix_(yte_inds,xtr_inds)] = B
+#     K[np.ix_(yte_inds,ytr_inds)] = C
+#     K[np.ix_(xte_inds,ytr_inds)] = D
+#
+#     return K
+
+
+def distibuted_atep_test(dw_paths, inds_te, inds_tr, max_depth=64, kernel_map='rootsift', norm='l2', use_gpu=True, intermediates_path=None, verbose=False):
+    if intermediates_path is None:
+        intermediates_path = '.'
+
     n = len(inds_te)
     m = len(inds_tr)
 
     xte_inds, xtr_inds = range(n/2), range(m/2)
     yte_inds, ytr_inds = range(n/2,n), range(m/2,m)
 
-    xte = load_darwins(inds_te[xte_inds], dw_paths)
-    xtr = load_darwins(inds_tr[xtr_inds], dw_paths)
-    A = atep(xte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=[2], verbose=verbose)
-    del xte
-    yte = load_darwins(inds_te[yte_inds], dw_paths)
-    B = atep(yte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=[2], verbose=verbose)
-    del xtr
-    ytr = load_darwins(inds_tr[ytr_inds], dw_paths)
-    C = atep(yte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=[2], verbose=verbose)
-    del yte
-    xte = load_darwins(inds_te[xte_inds], dw_paths)
-    D = atep(xte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=[2], verbose=verbose)
+    # st_time = time.time()
+    # xte = load_darwins(inds_te[xte_inds], dw_paths, max_depth=max_depth)
+    # xtr = load_darwins(inds_tr[xtr_inds], dw_paths, max_depth=max_depth)
+    # A = atep(xte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    # if intermediates_path:
+    #     with open(join(intermediates_path, 'A.pkl'), 'wb') as f:
+    #         cPickle.dump(A,f)
+    # print('[Distributed kernel (test)] Time %.2f secs.' % (time.time() - st_time))
+
+    # yte = load_darwins(inds_te[yte_inds], dw_paths, max_depth=max_depth)
+    # xtr = load_darwins(inds_tr[xtr_inds], dw_paths, max_depth=max_depth)
+    # B = atep(yte, xtr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    # if intermediates_path:
+    #     with open(join(intermediates_path, 'B.pkl'), 'wb') as f:
+    #         cPickle.dump(B,f)
+
+    # yte = load_darwins(inds_te[yte_inds], dw_paths, max_depth=max_depth)
+    # ytr = load_darwins(inds_tr[ytr_inds], dw_paths, max_depth=max_depth)
+    # C = atep(yte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    # if intermediates_path:
+    #     with open(join(intermediates_path, 'C.pkl'), 'wb') as f:
+    #         cPickle.dump(C,f)
+
+    # xte = load_darwins(inds_te[xte_inds], dw_paths, max_depth=max_depth)
+    # ytr = load_darwins(inds_tr[ytr_inds], dw_paths, max_depth=max_depth)
+    # D = atep(xte, ytr, is_train=False, kernel_map=kernel_map, norm=norm, use_gpu=use_gpu, verbose=verbose)
+    # if intermediates_path:
+    #     with open(join(intermediates_path, 'D.pkl'), 'wb') as f:
+    #         cPickle.dump(D,f)
+
+    with open(join(intermediates_path, 'A.pkl'), 'rb') as f:
+        A = cPickle.load(f)
+    with open(join(intermediates_path, 'B.pkl'), 'rb') as f:
+        B= cPickle.load(f)
+    with open(join(intermediates_path, 'C.pkl'), 'rb') as f:
+        C = cPickle.load(f)
+    with open(join(intermediates_path, 'D.pkl'), 'rb') as f:
+        D = cPickle.load(f)
 
     K = np.zeros((n,m), dtype=np.float32)
     K[np.ix_(xte_inds,xtr_inds)] = A
@@ -554,6 +726,11 @@ def distibuted_atep_test(dw_paths, inds_te, inds_tr, kernel_map='rootsift', norm
 # ------------------------------------------------------------------------
 
 def simpledarwintree(cfg):
+    dev = driver.Device(cfg['gpu_id'])
+    ctx = dev.make_context()
+    misc.init()
+    linalg.init()
+
     train_test_split = loadmat(join(cfg['dataset_path'], 'train_test_split.mat'))
 
     for pt in cfg['partitions']:
@@ -561,6 +738,7 @@ def simpledarwintree(cfg):
         root_kernels = {}
         tree_kernels = {}
         branch_kernels = {}
+        fusion_kernels = {}
 
         P = [None] * len(cfg['feat_types'])
         for f,feat_t in enumerate(cfg['feat_types']):
@@ -573,18 +751,18 @@ def simpledarwintree(cfg):
             tree_path = join(cfg['darws_path'], 'tree_representation-' + str(pt) + '-vd_' + feat_t + '_non-lin')
             branch_path = join(cfg['darws_path'], 'branch_representation-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['branch_pooling'] + '-pool')
 
-            maxdepth_str = '' if cfg['maximum_depth'] is None else 'maxdepth-' + str(cfg['maximum_depth']) + '_'
-
             root_kernel_name = 'kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
-            tree_kernel_name = 'tree_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + maxdepth_str + cfg['kernel_map']
-            branch_kernel_name = 'branch_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['branch_pooling'] + '-pool_' + maxdepth_str + cfg['kernel_map']
+            tree_kernel_name = 'tree_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['kernel_map']
+            branch_kernel_name = 'branch_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['branch_pooling'] + '-pool_' + cfg['kernel_map']
+            fusion_kernel_name = 'fusion_kernel-' + str(pt) + '-vd_' + feat_t + '_non-lin_' + cfg['branch_pooling'] + '-pool_' + cfg['kernel_map']
 
             root_kernel_filepath = join(cfg['output_kernels_path'], root_kernel_name + '.pkl')
             tree_kernel_filepath = join(cfg['output_kernels_path'], tree_kernel_name + '.pkl')
-            branch_kernel_filepath = join(cfg['output_kernels_path'], branch_kernel_name + '.pkl')
+            branch_kernel_filepath = join(cfg['output_kernels_path'], branch_kernel_name + '.pkl')  # TODO: remove "test"
+            fusion_kernel_filepath = join(cfg['output_kernels_path'], fusion_kernel_name + '.pkl')  # TODO: remove "test"
 
             # List darwin representations/tree-representations paths from disk
-            darwin_mat_filenames = [f for f in listdir(vd_path) if isfile(join(vd_path, f)) and splitext(f)[-1] == '.mat']
+            darwin_mat_filenames = [f for f in listdir(branch_path) if isfile(join(branch_path, f)) and splitext(f)[-1] == '.mat']
             darwin_mat_filenames.sort(key=get_id_from_darwinfile)
 
             root_dw_paths = [join(vd_path,f) for f in darwin_mat_filenames]
@@ -688,130 +866,216 @@ def simpledarwintree(cfg):
             norm = None if cfg['pre_processing'] else cfg['norm']
 
             st_time = time.time()
-            # try:
-            #     with open('Kn_train_gpu.pkl', 'rb') as f:
-            #         Kn_train = cPickle.load(f)
-            # except IOError:
-            #     Kn_train = distributed_atep(root_dw_paths, tree_dw_paths, inds_train, use_gpu=True, verbose=True)
-            #     with open('Kn_train_gpu.pkl', 'wb') as f:
-            #         cPickle.dump(Kn_train, f)
-            # try:
-            #     with open('Kn_test_gpu.pkl', 'rb') as f:
-            #         Kn_test = cPickle.load(f)
-            # except IOError:
-            #     Kn_test = distributed_atep(tree_dw_paths, inds_test, inds_train=inds_train, use_gpu=True, verbose=True)
-            #     with open('Kn_test_gpu.pkl', 'wb') as f:
-            #         cPickle.dump(Kn_test, f)
-            #
-            # train_and_classify([(Kn_train, Kn_test)], (labels_train,labels_test), metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # quit()
 
-            print (time.time()-st_time)
-            try:
-                with open(root_kernel_filepath, 'rb') as f:
-                    root_pkl = cPickle.load(f)
-            except:
-                all_roots_tr = load_darwins(inds_train, root_dw_paths)
-                all_roots_te = load_darwins(inds_test, root_dw_paths)
-
-                all_roots_tr = apply_kernel_map(all_roots_tr, map=cfg['kernel_map'])
-                all_roots_te = apply_kernel_map(all_roots_te, map=cfg['kernel_map'])
-                all_roots_tr = preprocessing.normalize(all_roots_tr, norm=cfg['norm'], axis=1)
-                all_roots_te = preprocessing.normalize(all_roots_te, norm=cfg['norm'], axis=1)
-
-                print('Kernel (train)...')
-                K_train = np.dot(all_roots_tr, all_roots_tr.T)
-                print('Kernel (test)...')
-                K_test  = np.dot(all_roots_te, all_roots_tr.T)
-
-                # print('Saving (kernel train/test)... '),
-                with open(root_kernel_filepath, 'wb') as f:
-                    cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
-                                      kernels=(K_train, K_test), labels=(labels_train, labels_test)), f)
-
-                root_pkl = dict(kernels=(K_train, K_test),labels=(labels_train,labels_test))
-                del all_roots_tr
-                del all_roots_te
-            root_kernels[feat_t] = root_pkl['kernels']
-
-            try:
-                with open(tree_kernel_filepath, 'rb') as f:
-                    tree_pkl = cPickle.load(f)
-            except IOError:
+            # ------
+            # ROOT
+            # ------
+            if 'r' in cfg['midlevels']:
                 try:
-                    with open(join(cfg['output_kernels_path'], tree_kernel_name + '.train.pkl'), 'rb') as f:
-                        Kn_train, _ = cPickle.load(f)['kernels'][0]
-                except IOError:
-                    print('Tree kernel (train)...')
-                    Kn_train = distributed_atep(tree_dw_paths, inds_train, use_gpu=True, verbose=True)
-                    print('Saving (kernel train)... '),
-                    with open(join(cfg['output_kernels_path'], tree_kernel_name + '.train.pkl'), 'wb') as f:
-                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
-                                          kernels=(Kn_train,None), labels=(labels_train,labels_test)), f)
-                print('Tree kernel (test)...')
-                Kn_test  = distributed_atep(tree_dw_paths, inds_test, inds_train=inds_train, use_gpu=True, verbose=True)
-                print('Saving kernels (train,test)... '),
-                with open(tree_kernel_filepath, 'wb') as f:
-                    cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
-                                      kernels=(Kn_train,Kn_test), labels=(labels_train,labels_test)), f)
-                    remove(join(cfg['output_kernels_path'], tree_kernel_name + '.train.pkl'))
-                tree_pkl = dict(kernels=(Kn_train, Kn_test),labels=(labels_train,labels_test))
-            tree_kernels[feat_t] = tree_pkl['kernels']
+                    with open(root_kernel_filepath, 'rb') as f:
+                        root_pkl = cPickle.load(f)
+                except:
+                    all_roots_tr = np.vstack(load_darwins(inds_train, root_dw_paths))
+                    all_roots_te = np.vstack(load_darwins(inds_test, root_dw_paths))
 
-            try:
-                with open(branch_kernel_filepath, 'rb') as f:
-                    branch_pkl = cPickle.load(f)
-            except IOError:
+                    all_roots_tr = apply_kernel_map(all_roots_tr, map=cfg['kernel_map'])
+                    all_roots_te = apply_kernel_map(all_roots_te, map=cfg['kernel_map'])
+                    all_roots_tr = preprocessing.normalize(all_roots_tr, norm=cfg['norm'], axis=1)
+                    all_roots_te = preprocessing.normalize(all_roots_te, norm=cfg['norm'], axis=1)
+
+                    print('Kernel (train)...')
+                    K_train = np.dot(all_roots_tr, all_roots_tr.T)
+                    print('Kernel (test)...')
+                    K_test  = np.dot(all_roots_te, all_roots_tr.T)
+
+                    # print('Saving (kernel train/test)... '),
+                    with open(root_kernel_filepath, 'wb') as f:
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                          kernels=(K_train, K_test), labels=(labels_train, labels_test)), f)
+
+                    root_pkl = dict(kernels=(K_train, K_test),labels=(labels_train,labels_test))
+                    del all_roots_tr
+                    del all_roots_te
+                root_kernels[feat_t] = root_pkl['kernels']
+
+            # ------
+            # NODES
+            # ------
+            if 'n' in cfg['midlevels']:
                 try:
-                    with open(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'), 'rb') as f:
-                        Kb_train,_ = cPickle.load(f)['kernels']
+                    with open(tree_kernel_filepath, 'rb') as f:
+                        tree_pkl = cPickle.load(f)
                 except IOError:
-                    print('Branch kernel (train)...')
-                    Kb_train = distributed_atep(branch_dw_paths, inds_train, use_gpu=True, verbose=True)
-                    print('Saving (kernel train)... '),
-                    with open(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'), 'wb') as f:
+                    Kn_train = None
+                    train = None
+                    # TODO: uncomment
+                    # ---
+                    try:
+                        with open(join(cfg['output_kernels_path'], tree_kernel_name + '.train.pkl'), 'rb') as f:
+                            Kn_train,_ = cPickle.load(f)['kernels']
+                    except IOError:
+                        print('Tree kernel (train)...')
+                        if cfg['distributed']:
+                            Kn_train = distributed_atep(tree_dw_paths, inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                        else:
+                            train = load_darwins(inds_train, tree_dw_paths, max_depth=cfg['max_depth'])
+                            Kn_train = atep(train, train, is_train=True, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                        print('Saving (kernel train)... '),
+                        with open(join(cfg['output_kernels_path'], tree_kernel_name + '.train.pkl'), 'wb') as f:
+                            cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                              kernels=(Kn_train,None), labels=(labels_train,labels_test)), f)
+                    # ---
+                    print('Tree kernel (test)...')
+                    if cfg['distributed']:
+                        Kn_test = distributed_atep(tree_dw_paths, inds_test, inds_train=inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                    else:
+                        if train is None:
+                            train = load_darwins(inds_train, tree_dw_paths, max_depth=cfg['max_depth'])
+                        test = load_darwins(inds_test, tree_dw_paths, max_depth=cfg['max_depth'])
+                        Kn_test = atep(test, train, is_train=False, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                    print('Saving kernels (train,test)... '),
+                    with open(tree_kernel_filepath, 'wb') as f:
                         cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
-                                          kernels=(Kb_train,None), labels=(labels_train,labels_test)), f)
+                                          kernels=(Kn_train,Kn_test), labels=(labels_train,labels_test)), f)
+                        # remove(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'))   # TODO: uncomment
+                    tree_pkl = dict(kernels=(Kn_train, Kn_test),labels=(labels_train,labels_test))
+                tree_kernels[feat_t] = tree_pkl['kernels']
 
-                print('Branch kernel (test)...')
-                Kb_test = distributed_atep(branch_dw_paths, inds_test, inds_train=inds_train, use_gpu=True, verbose=True)
-                print('Saving kernels (train,test)... '),
-                with open(branch_kernel_filepath, 'wb') as f:
-                    cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
-                                      kernels=(Kb_train,Kb_test), labels=(labels_train,labels_test)), f)
-                    remove(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'))
-                branch_pkl = dict(kernels=(Kb_train, Kb_test),labels=(labels_train,labels_test))
-            branch_kernels[feat_t] = branch_pkl['kernels']
+
+            # ------
+            # BRANCH
+            # ------
+            if 'b' in cfg['midlevels']:
+                try:
+                    with open(branch_kernel_filepath, 'rb') as f:
+                        branch_pkl = cPickle.load(f)
+                except IOError:
+                    Kb_train = None
+                    train = None
+                    # TODO: uncomment
+                    # ---
+                    try:
+                        with open(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'), 'rb') as f:
+                            Kb_train,_ = cPickle.load(f)['kernels']
+                    except IOError:
+                        print('Branch kernel (train)...')
+                        if cfg['distributed']:
+                            Kb_train = distributed_atep(branch_dw_paths, inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                        else:
+                            train = load_darwins(inds_train, branch_dw_paths, max_depth=cfg['max_depth'])
+                            Kb_train = atep(train, train, is_train=True, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                        print('Saving (kernel train)... '),
+                        with open(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'), 'wb') as f:
+                            cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                              kernels=(Kb_train,None), labels=(labels_train,labels_test)), f)
+                    # ---
+                    print('Branch kernel (test)...')
+                    if cfg['distributed']:
+                        Kb_test = distributed_atep(branch_dw_paths, inds_test, inds_train=inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                    else:
+                        if train is None: # if not train already loaded
+                            train = load_darwins(inds_train, branch_dw_paths, max_depth=cfg['max_depth'])
+                        test = load_darwins(inds_test, branch_dw_paths, max_depth=cfg['max_depth'])
+                        Kb_test = atep(test, train, is_train=False, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                    print('Saving kernels (train,test)... '),
+                    with open(branch_kernel_filepath, 'wb') as f:
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                          kernels=(Kb_train,Kb_test), labels=(labels_train,labels_test)), f)
+                        # remove(join(cfg['output_kernels_path'], branch_kernel_name + '.train.pkl'))   # TODO: uncomment
+                    branch_pkl = dict(kernels=(Kb_train, Kb_test),labels=(labels_train,labels_test))
+                branch_kernels[feat_t] = branch_pkl['kernels']
+
+            # ------
+            # FUSION
+            # ------
+            if 'nb' in cfg['midlevels']:
+                try:
+                    with open(fusion_kernel_filepath, 'rb') as f:
+                        fusion_pkl = cPickle.load(f)
+                except IOError:
+                    Kf_train = None
+                    train = None
+                    # TODO: uncomment
+                    # ---
+                    try:
+                        with open(join(cfg['output_kernels_path'], fusion_kernel_name + '.train.pkl'), 'rb') as f:
+                            Kf_train,_ = cPickle.load(f)['kernels']
+                    except IOError:
+                        print('Fusion kernel (train)...')
+                        if cfg['distributed']:
+                            Kf_train = distributed_atep([tree_dw_paths, branch_dw_paths], inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                        else:
+                            train = load_darwins(inds_train, [tree_dw_paths, branch_dw_paths], max_depth=cfg['max_depth'])
+                            Kf_train = atep(train, train, is_train=True, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                        print('Saving (kernel train)... '),
+                        with open(join(cfg['output_kernels_path'], fusion_kernel_name + '.train.pkl'), 'wb') as f:
+                            cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                              kernels=(Kf_train,None), labels=(labels_train,labels_test)), f)
+                    # ---
+                    print('Branch kernel (test)...')
+                    if cfg['distributed']:
+                        Kf_test = distributed_atep([tree_dw_paths, branch_dw_paths], inds_test, inds_train=inds_train, max_depth=cfg['max_depth'], use_gpu=True, verbose=True)
+                    else:
+                        if train is None: # if not train already loaded
+                            train = load_darwins(inds_train, [tree_dw_paths, branch_dw_paths], max_depth=cfg['max_depth'])
+                        test = load_darwins(inds_test, [tree_dw_paths, branch_dw_paths], max_depth=cfg['max_depth'])
+                        Kf_test = atep(test, train, is_train=False, kernel_map=cfg['kernel_map'], norm=cfg['norm'], use_gpu=True, verbose=True)
+                    print('Saving kernels (train,test)... '),
+                    with open(fusion_kernel_filepath, 'wb') as f:
+                        cPickle.dump(dict(kernel_map=kernel_map, norm=norm, \
+                                          kernels=(Kf_train,Kf_test), labels=(labels_train,labels_test)), f)
+                    fusion_pkl = dict(kernels=(Kf_train, Kf_test),labels=(labels_train,labels_test))
+                fusion_kernels[feat_t] = fusion_pkl['kernels']
+            # ---
 
             # Evaluate metric
-            print feat_t
-            print 'root'
-            train_and_classify([root_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            print 'node'
-            train_and_classify([tree_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            print 'branch'
-            train_and_classify([branch_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            print 'root + node'
-            train_and_classify([root_pkl['kernels'], tree_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            print 'root + branch'
-            train_and_classify([root_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            print 'root + node + branch'
-            train_and_classify([root_pkl['kernels'], tree_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
+            # print feat_t
+            if 'r' in cfg['midlevels']:
+                print 'r'
+                train_and_classify([root_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'n' in cfg['midlevels']:
+                print 'n'
+                train_and_classify([tree_pkl['kernels']], tree_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'b' in cfg['midlevels']:
+                print 'b'
+                train_and_classify([branch_pkl['kernels']], branch_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'n' in cfg['midlevels'] and 'b' in cfg['midlevels']:
+                print 'n + b'
+                train_and_classify([tree_pkl['kernels'], branch_pkl['kernels']], tree_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'nb' in cfg['midlevels']:
+                print 'nb'
+                train_and_classify([fusion_pkl['kernels']], fusion_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'r' in cfg['midlevels'] and 'n' in cfg['midlevels']:
+                print 'r + n'
+                train_and_classify([root_pkl['kernels'], tree_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'],  metric=cfg['metric'])
+            if 'r' in cfg['midlevels'] and 'b' in cfg['midlevels']:
+                print 'r + b'
+                train_and_classify([root_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'],  metric=cfg['metric'])
+            if 'r' in cfg['midlevels'] and 'nb' in cfg['midlevels']:
+                print 'r + nb'
+                train_and_classify([root_pkl['kernels'],fusion_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            if 'r' in cfg['midlevels'] and 'n' in cfg['midlevels'] and 'b' in cfg['midlevels']:
+                print 'r + n + b'
+                train_and_classify([root_pkl['kernels'], tree_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+
+            # print 'root + branch'
+            # train_and_classify([root_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            # print 'root + node + branch'
+            # train_and_classify([root_pkl['kernels'], tree_pkl['kernels'], branch_pkl['kernels']], root_pkl['labels'], C=cfg['svm_C'], metric=cfg['metric'])
+            # print
         print 'all'
 
-        # if len(root_kernels.keys()) != len(tree_kernels.keys()):
-        #     master_dict, slave_dict = root_kernels, tree_kernels\
-        #         if len(root_kernels.keys()) > len(tree_kernels.keys()) else tree_kernels, root_kernels
-        #     for feat_t,kernels in master_dict:
-        #         if not feat_t in slave_dict:
-        #             del slave_dict[feat_t]
+        # if len(cfg['feat_types']) > 1:
+        #     train_and_classify([root_kernels], root_pkl['labels'],C=cfg['svm_C'],  metric=cfg['metric'])
+        #     train_and_classify([tree_kernels], root_pkl['labels'],C=cfg['svm_C'],  metric=cfg['metric'])
+        #     train_and_classify([branch_kernels], root_pkl['labels'],C=cfg['svm_C'],  metric=cfg['metric'])
+        #     train_and_classify([fusion_kernels], root_pkl['labels'],C=cfg['svm_C'],  metric=cfg['metric'])
+        #     train_and_classify([root_kernels, fusion_kernels], root_pkl['labels'], metric=cfg['metric'])
+        #     train_and_classify([root_kernels, tree_kernels], root_pkl['labels'], metric=cfg['metric'])
+        #     train_and_classify([root_kernels, branch_kernels], root_pkl['labels'], metric=cfg['metric'])
+        #     train_and_classify([root_kernels, tree_kernels, branch_kernels], root_pkl['labels'], metric=cfg['metric'])
+        #     print
 
-        if len(cfg['feat_types']) > 1:
-            train_and_classify([root_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # train_and_classify([root_kernels, tree_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # train_and_classify([root_kernels, branch_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # train_and_classify([root_kernels, tree_kernels, branch_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # train_and_classify([tree_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-            # train_and_classify([branch_kernels], root_pkl['labels'], metric=cfg['metric'], neg_class=cfg['negative_class'])
-
+    ctx.pop()
+    ctx.detach()
     print 'done'
